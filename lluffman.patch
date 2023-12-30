@@ -1,0 +1,775 @@
+From 63004cf5b34b534f24f95cc436ca214bac722b6e Mon Sep 17 00:00:00 2001
+From: pokes <pokes@botnoise.org>
+Date: Fri, 28 Apr 2023 00:00:00 -0400
+Subject: [PATCH] Huffman-based steganographic encoding/decoding
+
+---
+ Makefile               |  10 ++-
+ examples/common.cpp    |  25 ++++++
+ examples/common.h      |   6 ++
+ examples/main/main.cpp |  67 ++++++++++++---
+ huffman.cpp            | 161 ++++++++++++++++++++++++++++++++++
+ huffman.h              |  29 +++++++
+ llama.cpp              | 191 +++++++++++++++++++++++++++++++++++++++--
+ llama.h                |  16 +++-
+ 8 files changed, 482 insertions(+), 23 deletions(-)
+ create mode 100644 huffman.cpp
+ create mode 100644 huffman.h
+
+diff --git a/Makefile b/Makefile
+index 2f828bf..d26cea2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -132,7 +132,8 @@ $(info I CC:       $(CCV))
+ $(info I CXX:      $(CXXV))
+ $(info )
+ 
+-default: main quantize perplexity embedding
++# default: main quantize perplexity embedding
++default : main
+ 
+ #
+ # Build library
+@@ -144,14 +145,17 @@ ggml.o: ggml.c ggml.h
+ llama.o: llama.cpp llama.h
+ 	$(CXX) $(CXXFLAGS) -c llama.cpp -o llama.o
+ 
++huffman.o: huffman.cpp huffman.h
++	$(CXX) $(CXXFLAGS) -c huffman.cpp -o huffman.o
++
+ common.o: examples/common.cpp examples/common.h
+ 	$(CXX) $(CXXFLAGS) -c examples/common.cpp -o common.o
+ 
+ clean:
+ 	rm -vf *.o main quantize perplexity embedding
+ 
+-main: examples/main/main.cpp ggml.o llama.o common.o
+-	$(CXX) $(CXXFLAGS) examples/main/main.cpp ggml.o llama.o common.o -o main $(LDFLAGS)
++main: examples/main/main.cpp ggml.o llama.o common.o huffman.o
++	$(CXX) $(CXXFLAGS) examples/main/main.cpp ggml.o llama.o common.o huffman.o -o main $(LDFLAGS)
+ 	@echo
+ 	@echo '====  Run ./main -h for help.  ===='
+ 	@echo
+diff --git a/examples/common.cpp b/examples/common.cpp
+index 5400f6b..ca7abc6 100644
+--- a/examples/common.cpp
++++ b/examples/common.cpp
+@@ -62,6 +62,31 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
+                 break;
+             }
+             params.prompt = argv[i];
++        } else if (arg == "-e" || arg == "--encode-from") {
++            if (++i >= argc) {
++                invalid_param = true;
++                break;
++            }
++            params.entropy_file = argv[i];
++            params.encode = true;
++        } else if (arg == "-d" || arg == "--decode-from") {
++            params.decode = true;
++            if (++i >= argc) {
++                invalid_param = true;
++                break;
++            }
++            std::ifstream file(argv[i]);
++            if (!file) {
++                fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
++                invalid_param = true;
++                break;
++            }
++            std::copy(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>(), back_inserter(params.decode_from));
++            /*
++            if (params.prompt.back() == '\n') {
++                params.prompt.pop_back();
++            }
++            */
+         } else if (arg == "-f" || arg == "--file") {
+             if (++i >= argc) {
+                 invalid_param = true;
+diff --git a/examples/common.h b/examples/common.h
+index 1505aa9..4eac911 100644
+--- a/examples/common.h
++++ b/examples/common.h
+@@ -50,6 +50,12 @@ struct gpt_params {
+     bool use_mlock         = false; // use mlock to keep model in memory
+     bool mem_test          = false; // compute maximum memory usage
+     bool verbose_prompt    = false; // print prompt tokens before generation
++
++    bool decode = false;
++    bool encode = false;
++
++    std::string entropy_file = "";
++    std::string decode_from = "";
+ };
+ 
+ bool gpt_params_parse(int argc, char ** argv, gpt_params & params);
+diff --git a/examples/main/main.cpp b/examples/main/main.cpp
+index 453450a..4fc11ec 100644
+--- a/examples/main/main.cpp
++++ b/examples/main/main.cpp
+@@ -1,5 +1,6 @@
+ #include "common.h"
+ #include "llama.h"
++#include "huffman.h"
+ 
+ #include <cassert>
+ #include <cinttypes>
+@@ -38,7 +39,7 @@ void sigint_handler(int signo) {
+ 
+ int main(int argc, char ** argv) {
+     gpt_params params;
+-    params.model = "models/llama-7B/ggml-model.bin";
++    params.model = "models/7B/ggml-model-q4_0.bin";
+ 
+     if (gpt_params_parse(argc, argv, params) == false) {
+         return 1;
+@@ -84,9 +85,6 @@ int main(int argc, char ** argv) {
+         params.prompt = gpt_random_prompt(rng);
+     }
+ 
+-//    params.prompt = R"(// this function checks if the number n is prime
+-//bool is_prime(int n) {)";
+-
+     llama_context * ctx;
+ 
+     // load the model
+@@ -99,7 +97,8 @@ int main(int argc, char ** argv) {
+         lparams.f16_kv     = params.memory_f16;
+         lparams.use_mlock  = params.use_mlock;
+ 
+-        ctx = llama_init_from_file(params.model.c_str(), lparams);
++        ctx = llama_init_from_file(params.model.c_str(), lparams,
++                                   params.entropy_file.c_str());
+ 
+         if (ctx == NULL) {
+             fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());
+@@ -138,7 +137,7 @@ int main(int argc, char ** argv) {
+ 
+     // tokenize the prompt
+     auto embd_inp = ::llama_tokenize(ctx, params.prompt, true);
+-
++    auto embd_decode = ::llama_tokenize(ctx, params.decode_from, true);
+     const int n_ctx = llama_n_ctx(ctx);
+ 
+     if ((int) embd_inp.size() > n_ctx - 4) {
+@@ -234,13 +233,27 @@ int main(int argc, char ** argv) {
+     int n_past     = 0;
+     int n_remain   = params.n_predict;
+     int n_consumed = 0;
++    int i_token = embd_inp.size();
++
++    int h_state    = 0;
++    int current_decode_char = 0;
++    int current_decode_bits = 0;    
+ 
+     // the first thing we will do is to output the prompt, so set color accordingly
+     set_console_color(con_st, CONSOLE_COLOR_PROMPT);
+ 
+     std::vector<llama_token> embd;
+-
+-    while (n_remain != 0 || params.interactive) {
++    
++    bool continue_loop;
++    while (true) {
++        if (!params.decode) {
++            continue_loop = n_remain > 0 || params.interactive;
++        } else {
++            continue_loop = i_token < embd_decode.size();
++        }
++        if (!continue_loop) {
++            break;
++        }
+         // predict
+         if (embd.size() > 0) {
+             // infinite text generation via context swapping
+@@ -273,6 +286,8 @@ int main(int argc, char ** argv) {
+         n_past += embd.size();
+         embd.clear();
+ 
++        std::vector<bool> bits_out;
++
+         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
+             // out of user input, sample next token
+             const int32_t top_k          = params.top_k;
+@@ -289,9 +304,36 @@ int main(int argc, char ** argv) {
+                     logits[llama_token_eos()] = 0;
+                 }
+ 
+-                id = llama_sample_top_p_top_k(ctx,
+-                        last_n_tokens.data() + n_ctx - params.repeat_last_n,
+-                        params.repeat_last_n, top_k, top_p, temp, repeat_penalty);
++                if (!params.decode) {
++                    id = llama_sample_top_p_top_k(ctx,
++                            last_n_tokens.data() + n_ctx - params.repeat_last_n,
++                            params.repeat_last_n, top_k, top_p, temp, repeat_penalty,
++                                                  (params.encode ? (&h_state) : NULL));
++                    if (params.encode && (h_state < 0)) {
++                        n_remain = 0;
++                    }
++                }
++                else {
++                    id = embd_decode[i_token];
++                    i_token++;
++                    bits_out = llama_sample_top_p_top_k_decode
++                        (ctx, last_n_tokens.data() + n_ctx - params.repeat_last_n,
++                         params.repeat_last_n, top_k, top_p, temp, repeat_penalty,
++                         id);
++
++                    for (int b = bits_out.size() - 1; b >= 0; b--) {
++                        if (bits_out[b]) {
++                            current_decode_char |= (0x01 << current_decode_bits);
++                        }
++                        current_decode_bits++;
++                        if (current_decode_bits == 8) {
++                            fprintf(stderr, "output: %c\n", current_decode_char);
++                            putchar(current_decode_char);
++                            current_decode_char = 0;
++                            current_decode_bits = 0;
++                        }
++                    }
++                }
+ 
+                 last_n_tokens.erase(last_n_tokens.begin());
+                 last_n_tokens.push_back(id);
+@@ -329,8 +371,9 @@ int main(int argc, char ** argv) {
+         }
+ 
+         // display text
+-        if (!input_noecho) {
++        if (!input_noecho && !params.decode) {
+             for (auto id : embd) {
++                //printf("%6d -> '%s'\n", id, llama_token_to_str(ctx, id));
+                 printf("%s", llama_token_to_str(ctx, id));
+             }
+             fflush(stdout);
+diff --git a/huffman.cpp b/huffman.cpp
+new file mode 100644
+index 0000000..a290a93
+--- /dev/null
++++ b/huffman.cpp
+@@ -0,0 +1,161 @@
++#include <vector>
++#include <queue>
++#include <stdio.h>
++#include "huffman.h"
++
++void print_huffman_code(huffman_node_t * p, int level) {
++    if (p->tag == HUFFMAN_LEAF) {
++        for (int i = 0; i < level; i++) { putchar(' '); }
++        printf("(%d)->%d\n", p->weight, p->value.leaf);
++    }
++    else {
++        for (int i = 0; i < level; i++) { putchar(' '); }
++        printf("left (%d):\n", p->weight);
++        print_huffman_code(p->value.pair.left, level+1);
++        for (int i = 0; i < level; i++) { putchar(' '); }
++        printf("right (%d):\n", p->weight);
++        print_huffman_code(p->value.pair.right, level+1);
++    }
++}
++
++huffman_node * make_huffman_code(std::vector<int> weights) {
++                                 //std::vector<token_id> leaves) {
++    std::vector<huffman_node*> nodes;
++    huffman_node * p;
++    nodes.reserve(weights.size()+1);
++    for (int i = 0; i < weights.size(); i++) {
++        p = new huffman_node;
++        p->tag = HUFFMAN_LEAF;
++        p->weight = weights[i];
++        p->value.leaf = i;
++        nodes.push_back(p);
++    }
++
++    for (int i = 0; i < (weights.size() - 1); i++) {
++        huffman_node *n1, *n2, *npair;
++        
++        int i_min = 0;
++        int v_min = nodes[0]->weight;
++        for (int j = 1; j < nodes.size(); j++) {
++            if (nodes[j]->weight < v_min) {
++                i_min = j;
++                v_min = nodes[j]->weight;
++            }
++        }
++        
++        n1 = nodes[i_min];
++        nodes.erase(nodes.begin() + i_min);
++
++        i_min = 0;
++        v_min = nodes[0]->weight;
++        for (int j = 1; j < nodes.size(); j++) {
++            if (nodes[j]->weight < v_min) {
++                i_min = j;
++                v_min = nodes[j]->weight;
++            }
++        }
++
++        n2 = nodes[i_min];
++        nodes.erase(nodes.begin() + i_min);
++
++        npair = new huffman_node;
++        npair->tag = HUFFMAN_PAIR;
++        npair->weight = n1->weight + n2->weight;
++        npair->value.pair.left = n1;
++        npair->value.pair.right = n2;
++
++        nodes.push_back(npair);
++    }
++    /*for (int i = 0; i < nodes.size(); i++) {
++        print_huffman_code(nodes[i], 0);
++        }*/
++    return nodes[0];
++}
++
++void free_huffman_code(huffman_node_t * code) {
++    if (code->tag == HUFFMAN_PAIR) {
++        free_huffman_code(code->value.pair.left);
++        free_huffman_code(code->value.pair.right);
++    }
++    delete code;
++}
++
++int huffman_encode(huffman_node_t * code, std::vector<bool> bit_source,
++                   int * p_source, leaf_t * p_decode) {
++    bool b;
++    while (1) {
++        if (code->tag == HUFFMAN_LEAF) {
++            *p_decode = code->value.leaf;
++            //*p_end = start;
++            return 0;
++        }
++        if (*p_source >= bit_source.size()) { // hit the end of the vector
++            return -1;
++        }
++
++        b = bit_source[*p_source];
++        (*p_source)++;
++
++        if (b) {
++            code = code->value.pair.right;
++        }
++        else {
++            code = code->value.pair.left;
++        }
++    }
++}
++
++std::vector<bool> huffman_decode(huffman_node_t * code, leaf_t id, int * status) {
++    int lstatus;
++    std::vector<bool> result = {};
++    if (code->tag == HUFFMAN_LEAF) {
++        if (id == code->value.leaf) {
++            *status = 1;
++            return result;
++        }
++        else {
++            *status = 0;
++            return result;
++        }
++    }
++    else {
++        result = huffman_decode(code->value.pair.left, id, &lstatus);
++        if (lstatus == 1) {
++            result.push_back(false);
++            *status = 1;
++            return result;
++        }
++
++        result = huffman_decode(code->value.pair.right, id, &lstatus);
++        if (lstatus == 1) {
++            result.push_back(true);
++            *status = 1;
++            return result;
++        }
++
++        *status = 0;
++        return result;
++    }   
++}
++
++std::vector<bool> read_file_as_bool(std::string path) {
++    int c;
++    std::vector<bool> x;
++
++    FILE * fp = fopen(path.c_str(), "rb");
++    while (1) {
++        c = fgetc(fp);
++        if (c == EOF) { break; }
++        for (int i = 0; i < 8; i++) {
++            x.push_back((c & (0x01 << i)) >> i);
++        }
++    }
++    /*
++    printf("read %d bits:\n", x.size());
++    for (int i = 0; i < x.size(); i++) {
++        printf("%c", x[i] ? '1' : '0');
++    }
++    printf("\n");
++    */
++    return x;
++}
+diff --git a/huffman.h b/huffman.h
+new file mode 100644
+index 0000000..dc09eef
+--- /dev/null
++++ b/huffman.h
+@@ -0,0 +1,29 @@
++#include <vector>
++#include <string>
++
++#define HUFFMAN_LEAF 0
++#define HUFFMAN_PAIR 1
++
++typedef int leaf_t;
++
++typedef struct huffman_pair {
++    struct huffman_node * left;
++    struct huffman_node * right;
++} huffman_pair_t;
++
++typedef struct huffman_node {
++    int tag;
++    int weight;
++    union {
++        leaf_t leaf;
++        struct huffman_pair pair;
++    } value;
++} huffman_node_t;
++
++huffman_node * make_huffman_code(std::vector<int> weights);
++
++void free_huffman_code(huffman_node_t * code);
++int huffman_encode(huffman_node_t * code, std::vector<bool> bit_source,
++                   int * p_source, leaf_t * p_decode);
++std::vector<bool> huffman_decode(huffman_node_t * code, leaf_t id, int * status);
++std::vector<bool> read_file_as_bool(std::string path);
+diff --git a/llama.cpp b/llama.cpp
+index 854bb89..c2862cd 100644
+--- a/llama.cpp
++++ b/llama.cpp
+@@ -1,6 +1,7 @@
+ #include "llama.h"
+ 
+ #include "ggml.h"
++#include "huffman.h"
+ 
+ #include <cinttypes>
+ #include <fstream>
+@@ -179,6 +180,9 @@ struct llama_vocab {
+ 
+ struct llama_context {
+     std::mt19937 rng;
++    
++    std::vector<bool> hsource;
++    int ihsource = 0;
+ 
+     int64_t t_load_us = 0;
+     int64_t t_start_us = 0;
+@@ -1186,7 +1190,9 @@ static llama_vocab::id llama_sample_top_p_top_k(
+         int top_k,
+         float top_p,
+         float temp,
+-        float repeat_penalty) {
++        float repeat_penalty,
++        int * hstate) {
++    //auto & hsource = lctx.hsource;
+     auto & rng = lctx.rng;
+ 
+     const int n_logits = lctx.model.hparams.n_vocab;
+@@ -1238,12 +1244,15 @@ static llama_vocab::id llama_sample_top_p_top_k(
+ 
+     // compute probs for the top k tokens
+     std::vector<float> probs;
++    std::vector<int> iweights;
+     probs.reserve(logits_id.size());
++    iweights.reserve(logits_id.size());
+ 
+     double sum = 0.0;
+     for (const auto & kv : logits_id) {
+         const float p = expf(kv.first - maxl);
+         probs.push_back(p);
++        //printf("p=%f\n",p);
+         sum += p;
+     }
+ 
+@@ -1266,9 +1275,24 @@ static llama_vocab::id llama_sample_top_p_top_k(
+         cumsum = 1.0/cumsum;
+         for (int i = 0; i < (int) probs.size(); i++) {
+             probs[i] *= cumsum;
++            iweights.push_back((int)(ceilf(probs[i] * 65536)));
+         }
+     }
+ 
++    double h = 0.0;
++    for (auto & p : probs) {
++        h += - p * logf(p) / logf(2.0);
++    }
++
++    //printf("\n");
++    double cump = 0.0;
++    for (int i = 0; i < (int) probs.size(); i++) {
++        cump += probs[i];
++        /*fprintf(stderr,"%8.5f %8.5f: %6d -> '%s'\n", probs[i], cump, logits_id[i].second,
++          llama_token_to_str(&lctx, logits_id[i].second));*/
++    }
++    //printf("\nllama_sample_top_p_top_k: H = %f\n", h);
++
+     //printf("\n");
+     //for (int i = 0; i < (int) 10; i++) {
+     //    printf("%d: '%s' %f\n", i, vocab.id_to_token.at(logits_id[i].second).c_str(), probs[i]);
+@@ -1276,12 +1300,131 @@ static llama_vocab::id llama_sample_top_p_top_k(
+     //printf("\n\n");
+     //exit(0);
+ 
+-    std::discrete_distribution<> dist(probs.begin(), probs.end());
+-    int idx = dist(rng);
++    int idx;
++    if (hstate == NULL) {
++        std::discrete_distribution<> dist(probs.begin(), probs.end());
++        idx = dist(rng);
++    }
++    else {
++        huffman_node_t * code = make_huffman_code(iweights);
++        *hstate = huffman_encode(code, lctx.hsource, &lctx.ihsource, &idx);
++        free_huffman_code(code);
++    }
+ 
+     return logits_id[idx].second;
+ }
+ 
++static std::vector<bool> llama_sample_top_p_top_k_decode(
++        llama_context & lctx,
++        const std::vector<llama_vocab::id> & last_n_tokens,
++        int top_k,
++        float top_p,
++        float temp,
++        float repeat_penalty,
++        llama_vocab::id token) {
++    //auto & hsource = lctx.hsource;
++
++    const int n_logits = lctx.model.hparams.n_vocab;
++
++    const auto & logits = lctx.logits;
++    const auto * plogits = logits.data() + logits.size() - n_logits;
++
++    std::vector<std::pair<float, llama_vocab::id>> logits_id;
++    logits_id.reserve(n_logits);
++
++    {
++        const float scale = 1.0f/temp;
++        for (int i = 0; i < n_logits; ++i) {
++            // repetition penalty from ctrl paper (https://arxiv.org/abs/1909.05858)
++            // credit https://github.com/facebookresearch/llama/compare/main...shawwn:llama:main
++            if (std::find(last_n_tokens.begin(), last_n_tokens.end(), i) != last_n_tokens.end()) {
++                // if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
++                if (plogits[i] < 0.0f) {
++                    logits_id.push_back(std::make_pair(plogits[i]*scale*repeat_penalty, i));
++                } else {
++                    logits_id.push_back(std::make_pair(plogits[i]*scale/repeat_penalty, i));
++                }
++            } else {
++                logits_id.push_back(std::make_pair(plogits[i]*scale, i));
++            }
++        }
++    }
++
++    sample_top_k(logits_id, top_k);
++
++    float maxl = -std::numeric_limits<float>::infinity();
++    for (const auto & kv : logits_id) {
++        maxl = Max(maxl, kv.first);
++    }
++
++    // compute probs for the top k tokens
++    std::vector<float> probs;
++    std::vector<int> iweights;
++    probs.reserve(logits_id.size());
++    iweights.reserve(logits_id.size());
++
++    double sum = 0.0;
++    for (const auto & kv : logits_id) {
++        const float p = expf(kv.first - maxl);
++        probs.push_back(p);
++        //printf("p=%f\n",p);
++        sum += p;
++    }
++
++    // normalize the probs
++    for (auto & p : probs) {
++        p /= sum;
++    }
++
++    if (top_p < 1.0) {
++        double cumsum = 0.0;
++        for (int i = 0; i < (int) probs.size(); i++) {
++            cumsum += probs[i];
++            if (cumsum >= top_p) {
++                probs.resize(i + 1);
++                logits_id.resize(i + 1);
++                break;
++            }
++        }
++
++        cumsum = 1.0/cumsum;
++        for (int i = 0; i < (int) probs.size(); i++) {
++            probs[i] *= cumsum;
++            iweights.push_back((int)(ceilf(probs[i] * 65536)));
++        }
++    }
++
++    double h = 0.0;
++    for (auto & p : probs) {
++        h += - p * logf(p) / logf(2.0);
++    }
++
++    //printf("\n");
++    double cump = 0.0;
++    int ptoken = -1;
++    for (int i = 0; i < (int) probs.size(); i++) {
++        cump += probs[i];
++        /*fprintf(stderr,"%8.5f %8.5f: %6d -> '%s'\n", probs[i], cump, logits_id[i].second,
++          llama_token_to_str(&lctx, logits_id[i].second));*/
++        if (token == logits_id[i].second) {
++            ptoken = i;
++        }
++    }
++    
++    huffman_node_t * code = make_huffman_code(iweights);
++    std::vector<bool> dbits;
++    int status;
++    dbits = huffman_decode(code, ptoken, &status);
++    //fprintf(stderr, "calling huffman_decode with ptoken = %d\n", token);
++    if (status == 0) {
++        fprintf(stderr, "error decoding: token not found\n");
++        exit(1);
++    }
++    free_huffman_code(code);
++
++    return dbits;
++}
++
+ //
+ // quantization
+ //
+@@ -1586,7 +1729,8 @@ static bool llama_model_quantize_internal(const std::string & fname_inp, const s
+ 
+ struct llama_context * llama_init_from_file(
+                              const char * path_model,
+-            struct llama_context_params   params) {
++                             struct llama_context_params   params,
++                             const char * entropy_path) {
+     ggml_time_init();
+ 
+     llama_context * ctx = new llama_context;
+@@ -1596,6 +1740,10 @@ struct llama_context * llama_init_from_file(
+     }
+ 
+     ctx->rng = std::mt19937(params.seed);
++    if (!(entropy_path == NULL) && !(strcmp(entropy_path, "") == 0)) {
++        ctx->hsource = read_file_as_bool(entropy_path);
++    }
++    ctx->ihsource = 0;
+     ctx->logits_all = params.logits_all;
+ 
+     ggml_type memory_type = params.f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
+@@ -1790,7 +1938,8 @@ llama_token llama_sample_top_p_top_k(
+                     int   top_k,
+                   float   top_p,
+                   float   temp,
+-                  float   repeat_penalty) {
++                  float   repeat_penalty,
++                    int * h_status) {
+     const int64_t t_start_sample_us = ggml_time_us();
+ 
+     llama_token result = 0;
+@@ -1804,7 +1953,35 @@ llama_token llama_sample_top_p_top_k(
+             top_k,
+             top_p,
+             temp,
+-            repeat_penalty);
++            repeat_penalty, h_status);
++
++    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
++    ctx->n_sample++;
++
++    return result;
++}
++
++std::vector<bool> llama_sample_top_p_top_k_decode(
++          llama_context * ctx,
++      const llama_token * last_n_tokens_data,
++                    int   last_n_tokens_size,
++                    int   top_k,
++                  float   top_p,
++                  float   temp,
++                  float   repeat_penalty,
++                   llama_token token) {
++    const int64_t t_start_sample_us = ggml_time_us();
++
++    // TODO: avoid this ...
++    const auto last_n_tokens = std::vector<llama_token>(last_n_tokens_data, last_n_tokens_data + last_n_tokens_size);
++
++    auto result = llama_sample_top_p_top_k_decode(
++            *ctx,
++            last_n_tokens,
++            top_k,
++            top_p,
++            temp,
++            repeat_penalty, token);
+ 
+     ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+     ctx->n_sample++;
+@@ -1826,6 +2003,8 @@ void llama_print_timings(struct llama_context * ctx) {
+     fprintf(stderr, "%s: prompt eval time = %8.2f ms / %5d tokens (%8.2f ms per token)\n", __func__, 1e-3 * ctx->t_p_eval_us, n_p_eval, 1e-3 * ctx->t_p_eval_us / n_p_eval);
+     fprintf(stderr, "%s:        eval time = %8.2f ms / %5d runs   (%8.2f ms per run)\n",   __func__, 1e-3 * ctx->t_eval_us,   n_eval,   1e-3 * ctx->t_eval_us   / n_eval);
+     fprintf(stderr, "%s:       total time = %8.2f ms\n", __func__, (t_end_us - ctx->t_start_us)/1000.0);
++
++    fprintf(stderr, "consumed %d entropy bits\n", ctx->ihsource);
+ }
+ 
+ void llama_reset_timings(struct llama_context * ctx) {
+diff --git a/llama.h b/llama.h
+index 04e2bf7..88d5388 100644
+--- a/llama.h
++++ b/llama.h
+@@ -4,6 +4,7 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdbool.h>
++#include <vector>
+ 
+ #ifdef LLAMA_SHARED
+ #    if defined(_WIN32) && !defined(__MINGW32__)
+@@ -71,7 +72,8 @@ extern "C" {
+     // Return NULL on failure
+     LLAMA_API struct llama_context * llama_init_from_file(
+                              const char * path_model,
+-            struct llama_context_params   params);
++                             struct llama_context_params   params,
++                             const char * entropy_path);
+ 
+     // Frees all allocated memory
+     LLAMA_API void llama_free(struct llama_context * ctx);
+@@ -153,7 +155,17 @@ extern "C" {
+                         int   top_k,
+                       float   top_p,
+                       float   temp,
+-                      float   repeat_penalty);
++                      float   repeat_penalty,
++                        int * h_status);
++    std::vector<bool> llama_sample_top_p_top_k_decode(
++          llama_context * ctx,
++      const llama_token * last_n_tokens_data,
++                    int   last_n_tokens_size,
++                    int   top_k,
++                  float   top_p,
++                  float   temp,
++                  float   repeat_penalty,
++          llama_token token);
+ 
+     // Performance information
+     LLAMA_API void llama_print_timings(struct llama_context * ctx);
+-- 
+2.30.2
+
