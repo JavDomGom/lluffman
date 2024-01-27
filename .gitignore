@@ -1,3 +1,5 @@
+*message.txt
+
 *.o
 *.a
 .cache/
@@ -15,7 +17,7 @@ build-no-accel/
 build-sanitize-addr/
 build-sanitize-thread/
 
-models/*
+models/7B/*.bin
 
 /main
 /quantize
@@ -33,3 +35,5 @@ compile_commands.json
 .venv
 __pycache__
 .swiftpm
+
+.idea/

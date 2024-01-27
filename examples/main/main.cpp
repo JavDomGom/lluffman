@@ -39,7 +39,6 @@ void sigint_handler(int signo) {
 
 int main(int argc, char ** argv) {
     gpt_params params;
-    params.model = "models/7B/ggml-model-q4_0.bin";
 
     if (gpt_params_parse(argc, argv, params) == false) {
         return 1;

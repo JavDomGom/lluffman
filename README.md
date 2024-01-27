@@ -3,11 +3,41 @@
 ## Description
 This repository contains complete source code from the original patch created and published by [Pokes](https://botnoise.org/~pokes/) in this [link](https://botnoise.org/~pokes/lluffman/).
 
-First you must download some model like 7B, 13B, 30B, etc. Then you can compile this patch:
+## How to compile
+First you must download some model like 7B, 13B, 30B, etc, for examle from this [link](https://huggingface.co/ocrickard/LLaMa-7B-ggml-4bit-updated/tree/665b01ed0e5b73bb889f75c6060efb63164df354) and save the `.bin` file into the `models/7B/` directory.
+
+Then you can compile this patch:
 ```bash
 ~$ make
 ```
+Some warnings may appear, don't worry too much about this.
+The code is now compiled and ready to use.
 
+## How to use
+
+The patch for llama.cpp that will compile to an encoder and decoder is here.
+
+This patch is based on [this specific revision](https://github.com/ggerganov/llama.cpp/commit/53dbba769537e894ead5c6913ab2fd3a4658b738) of llama.cpp, and I can offer no reassurance that it would work on other revisions, or be easily rebase-able. But it works for me.
+
+It adds two (currently undocumented) switches to the main executable:
+
+* Adding `-e [filename]` will encode the contents of the file given. llama.cpp has a lot of output, but most is to stderr. Redirecting the output to a file will give you clean text that can go into the decoder.
+* Adding `-d [filename]` will decode the text in the file given. Same thing applies here, lots of output but stdout is clean.
+
+The sender of a secret message should, for example, run
+
+```
+./main -e secret-message.txt -m models/7B/ggml-model-q4_1.bin -p "Larry" > encoded-message.txt
+```
+and deliver encoded-message.txt to the recipient. The recipient should run
+```
+./main -d encoded-message.txt -m models/7B/ggml-model-q4_1.bin -p "Larry" > secret-message.txt
+```
+to recover the message.
+
+You can use other models for encoding and decoding by specifying the path to the downloaded `.bin` file using the `-m` flag, for example: `-m models/7B/ggml-model-q4_1.bin`
+
+## How to work
 2023-04-28
 
 ```
@@ -46,7 +76,7 @@ The model normally operates by continually generating a predicted probability di
 ```
  prob.    cumulative
  0.77315  0.77315:    310 -> ' of'
- 0.15700  0.93015:    408 -> ' as'        
+ 0.15700  0.93015:    408 -> ' as'
  0.03834  0.96850:   5429 -> ' told'
  0.03150  1.00000:    393 -> ' that'
 ```
@@ -81,28 +111,6 @@ A decoder can be constructed by regenerating the same Huffman code for each next
 4. Add the next token into LLaMA and repeat.
 
 If all goes right, steps 1 and 2 at the encoder and decoder should produce the same thing, and when they do, the decoder recovers the same data. Both the encoder and decoder need to have the same prompt and other settings, including temperature, top k, top p, etc., and of course the same model.
-
-## Usage
-
-The patch for llama.cpp that will compile to an encoder and decoder is here.
-
-This patch is based on [this specific revision](https://github.com/ggerganov/llama.cpp/commit/53dbba769537e894ead5c6913ab2fd3a4658b738) of llama.cpp, and I can offer no reassurance that it would work on other revisions, or be easily rebase-able. But it works for me.
-
-It adds two (currently undocumented) switches to the main executable:
-
-* Adding `-e [filename]` will encode the contents of the file given. llama.cpp has a lot of output, but most is to stderr. Redirecting the output to a file will give you clean text that can go into the decoder.
-* Adding `-d [filename]` will decode the text in the file given. Same thing applies here, lots of output but stdout is clean.
-
-The sender of a secret message should, for example, run
-
-```
-./main -e secret-message.txt -p "Larry" > encoded-message.txt
-```
-and deliver encoded-message.txt to the recipient. The recipient should run
-```
-./main -d encoded-message.txt -p "Larry" > secret-message.txt
-```
-to recover the message.
 
 ## Caveats
 
